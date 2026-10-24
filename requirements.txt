@@ -1,0 +1,4 @@
+# The pip OpenCV Python wheel provides its bundled FFmpeg backend on supported platforms.
+opencv-python>=4.10,<5
+numpy>=1.26,<3
+tzdata>=2024.1

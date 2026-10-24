@@ -1,0 +1,154 @@
+{
+  "stream": {
+    "url": "https://<URI>.m3u8",
+    "open_timeout_seconds": 10,
+    "read_timeout_seconds": 10,
+    "reconnect_delay_seconds": 3
+  },
+  "video": {
+    "detection_fps": 5,
+    "reference_width": 1280,
+    "reference_height": 720,
+    "panel_roi": null,
+    "min_panel_mean_brightness": 15
+  },
+  "detection": {
+    "confirmation_frames": 2,
+    "inner_ellipse_fraction": 0.82
+  },
+  "output": {
+    "screenshots_dir": "screenshots",
+    "timezone": "local",
+    "jpeg_quality": 90
+  },
+  "indicators": [
+    {
+      "id": "RED_1",
+      "name": "System Failure",
+      "color": "red",
+      "normal_state": "OFF",
+      "roi": [
+        136,
+        586,
+        17,
+        17
+      ],
+      "hue_ranges": [
+        [
+          0,
+          12
+        ],
+        [
+          168,
+          179
+        ]
+      ],
+      "min_saturation": 120,
+      "min_brightness": 170,
+      "on_fraction": 0.24,
+      "off_fraction": 0.08
+    },
+    {
+      "id": "GREEN",
+      "name": "Status OK",
+      "color": "green",
+      "normal_state": "ON",
+      "roi": [
+        139,
+        562,
+        17,
+        17
+      ],
+      "hue_ranges": [
+        [
+          35,
+          90
+        ]
+      ],
+      "min_saturation": 95,
+      "min_brightness": 135,
+      "on_fraction": 0.22,
+      "off_fraction": 0.07
+    },
+    {
+      "id": "YELLOW",
+      "name": "In Production",
+      "color": "yellow",
+      "normal_state": "ON",
+      "roi": [
+        140,
+        540,
+        17,
+        17
+      ],
+      "hue_ranges": [
+        [
+          15,
+          40
+        ]
+      ],
+      "min_saturation": 90,
+      "min_brightness": 150,
+      "on_fraction": 0.22,
+      "off_fraction": 0.07
+    },
+    {
+      "id": "RED_2",
+      "name": "Pressure Failure",
+      "color": "red",
+      "normal_state": "OFF",
+      "roi": [
+        147,
+        627,
+        17,
+        17
+      ],
+      "hue_ranges": [
+        [
+          0,
+          12
+        ],
+        [
+          168,
+          179
+        ]
+      ],
+      "min_saturation": 120,
+      "min_brightness": 170,
+      "on_fraction": 0.24,
+      "off_fraction": 0.08
+    },
+    {
+      "id": "RED_3",
+      "name": "Machine Failure",
+      "color": "red",
+      "normal_state": "OFF",
+      "roi": [
+        145,
+        604,
+        17,
+        17
+      ],
+      "hue_ranges": [
+        [
+          0,
+          12
+        ],
+        [
+          168,
+          179
+        ]
+      ],
+      "min_saturation": 120,
+      "min_brightness": 170,
+      "on_fraction": 0.24,
+      "off_fraction": 0.08
+    }
+  ],
+  "panel_roi": [
+    136,
+    540,
+    28,
+    104
+  ]
+}
