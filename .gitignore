@@ -14,9 +14,8 @@ poetry.lock
 # Images
 screenshots/*
 !screenshots/.gitkeep
-calibration_frame.jpg
-inspection.jpg
 demo.avi
+*.jpg
 
 # Config
 config.json.bak
@@ -25,6 +24,7 @@ demo_config.json
 
 # Mgmt
 git.sh
+_architecture/*
 
 # Misc
 *.html

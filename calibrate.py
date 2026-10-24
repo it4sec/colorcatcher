@@ -1,631 +1,437 @@
-#!/usr/bin/env python3
-"""Point-and-click, single-frame calibration for the Factory Indicator Monitor MVP.
+"""GUI calibration using one full-frame brightness baseline for each sensor.
 
-Run alongside config.json: poetry run python calibrate.py
-
-Requires OpenCV built with GUI support (opencv-python, not headless).
-No network connections are made until the user executes this script with a
-stream configured. Use --image FILE for completely offline calibration.
+Offline when --image is provided. Without --image, an operator explicitly
+requests one frame from their configured source.
 """
-
 from __future__ import annotations
 
 import argparse
 import copy
 import json
 import os
+from pathlib import Path
 import shutil
-import stat
 import sys
 import tempfile
-from pathlib import Path
-from typing import Any
 
 import cv2
+import numpy as np
+
+from modules.detector import brightness_score
+from modules.stream import StreamReader
 
 
-INDICATORS = (
-    ("RED_1", "System Failure"),
-    ("GREEN", "Status OK"),
-    ("YELLOW", "In Production"),
-    ("RED_2", "Pressure Failure"),
-    ("RED_3", "Machine Failure"),
-)
-
-# Pixel-coordinate ROIs: (x, y, width, height), in the ORIGINAL video frame.
-Rect = tuple[int, int, int, int]
+class Cancelled(Exception):
+    """User closed the calibration UI without saving."""
 
 
-def _key(text: object) -> str:
-    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+def reconcile_count(config: dict, *, confirm_delete: bool = False) -> dict:
+    """Increase config sensor list without dropping existing identities/settings.
+
+    Requires an affirmative operator confirmation before removing entries.
+    """
+    from main import _number
+    count = config["sensor_count"]
+    _number(count, "sensor_count", 1, 100_000, integer=True)
+    entries = config["indicators"]
+    if not isinstance(entries, list):
+        raise ValueError("indicators must be a list")
+    existing = {item["id"] for item in entries}
+    if len(entries) > count:
+        if not confirm_delete:
+            removed = ", ".join(item["id"] for item in entries[count:])
+            choice = input(f"Delete sensor configurations [{removed}]? Type DELETE to confirm: ")
+            if choice != "DELETE":
+                raise Cancelled("Sensor deletion not authorized")
+        del entries[count:]
+    sequence = 1
+    while len(entries) < count:
+        while f"SENSOR_{sequence:03d}" in existing:
+            sequence += 1
+        identifier = f"SENSOR_{sequence:03d}"
+        existing.add(identifier)
+        entries.append({"id": identifier, "name": identifier, "normal_state": "OFF",
+                        "roi": None, "reference_roi": None, "baseline_brightness": None,
+                        "baseline_reference_brightness": None, "baseline_state": "OFF"})
+    return config
 
 
-def _find_indicators(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    entries = config.get("indicators")
-    if isinstance(entries, list):
-        candidates = [(entry.get("id", ""), entry) for entry in entries if isinstance(entry, dict)]
-    elif isinstance(entries, dict):
-        candidates = list(entries.items())
-    else:
-        raise ValueError("config.json must contain an 'indicators' list or object")
 
-    aliases = {
-        "RED_1": {"red1", "systemfailure", "upperred"},
-        "GREEN": {"green", "statusok"},
-        "YELLOW": {"yellow", "inproduction"},
-        "RED_2": {"red2", "pressurefailure", "lowerred1"},
-        "RED_3": {"red3", "machinefailure", "lowerred2"},
-    }
-    result: dict[str, dict[str, Any]] = {}
-    claimed: set[int] = set()
-    for ident, name in INDICATORS:
-        matches = [
-            obj for ref, obj in candidates
-            if isinstance(obj, dict)
-            and (aliases[ident] & {_key(ref), _key(obj.get("id", "")), _key(obj.get("name", ""))})
-        ]
-        if len(matches) != 1 or id(matches[0]) in claimed:
-            raise ValueError(f"Cannot identify exactly one configured indicator for {ident} ({name})")
-        result[ident] = matches[0]
-        claimed.add(id(matches[0]))
-    return result
+def _invalidate(sensor: dict) -> None:
+    sensor["baseline_brightness"] = None
+    sensor["baseline_reference_brightness"] = None
 
 
-def _stream_source(config: dict[str, Any]) -> str:
-    for holder, fields in (
-        (config.get("stream"), ("url", "hls_url", "uri", "source")),
-        (config, ("stream_url", "hls_url", "video_url")),
-        (config.get("video"), ("url", "stream_url", "source")),
-    ):
-        if isinstance(holder, dict):
-            for field in fields:
-                value = holder.get(field)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-    raise ValueError("No stream URL found; use --source or set stream.url in config.json")
+def capture_baseline(sensor: dict, frame: np.ndarray) -> float:
+    """Record the arithmetic mean of the marked area's grayscale pixels."""
+    brightness, reference = brightness_score(frame, sensor)
+    sensor.setdefault("baseline_state", sensor["normal_state"])
+    sensor["baseline_brightness"] = round(brightness, 4)
+    sensor["baseline_reference_brightness"] = (round(reference, 4)
+                                               if reference is not None else None)
+    return brightness
 
 
-def _dimension_fields(node: dict[str, Any], location: str) -> list[tuple[str, str]]:
-    """Find existing width/height fields without creating an unknown schema."""
-    pairs = (
-        ("reference_width", "reference_height"),
-        ("video_reference_width", "video_reference_height"),
-        ("frame_reference_width", "frame_reference_height"),
-        ("reference_frame_width", "reference_frame_height"),
-    )
-    found = [pair for pair in pairs if pair[0] in node and pair[1] in node]
-    if location and location.split(".")[-1] in {
-        "video", "frame", "reference_dimensions", "reference_resolution",
-        "reference_size", "video_reference", "frame_reference", "reference_frame",
-    } and "width" in node and "height" in node:
-        found.append(("width", "height"))
-    return found
-
-
-def _patch_dimensions(config: dict[str, Any], width: int, height: int) -> int:
-    updated = 0
-
-    def walk(node: Any, path: str = "") -> None:
-        nonlocal updated
-        if not isinstance(node, dict):
-            return
-        for wkey, hkey in _dimension_fields(node, path):
-            node[wkey], node[hkey] = width, height
-            updated += 1
-        for key, value in node.items():
-            if isinstance(value, dict):
-                walk(value, f"{path}.{key}" if path else key)
-            elif key in {
-                "reference_dimensions", "reference_resolution", "reference_size",
-                "video_reference_dimensions", "frame_reference_dimensions",
-            } and isinstance(value, list) and len(value) == 2:
-                node[key] = [width, height]
-                updated += 1
-        # These flags only describe frame/ROI calibration, not brightness thresholds.
-        for flag in ("reference_dimensions_calibrated", "roi_calibrated"):
-            if flag in node and isinstance(node[flag], bool):
-                node[flag] = True
-
-    walk(config)
-    if not updated:
-        raise ValueError(
-            "Cannot locate existing video reference dimensions in config.json. "
-            "Expected e.g. video.reference_width/reference_height or "
-            "video.reference_dimensions.width/height. No changes saved."
-        )
-    return updated
-
-
-def _write_rect(target: dict[str, Any], field: str, rect: Rect, dimensions: tuple[int, int]) -> None:
-    """Replace an existing ROI while preserving its representation and other settings."""
-    if field not in target:
-        raise ValueError(f"Missing '{field}' ROI field; cannot safely guess config schema")
-    x, y, w, h = rect
-    roi = target[field]
-    normalized = "norm" in field.lower() or _key(target.get("roi_units", "")) in {
-        "normalized", "relative", "fraction",
-    }
-    if normalized:
-        frame_w, frame_h = dimensions
-        a, b, c, d = x / frame_w, y / frame_h, w / frame_w, h / frame_h
-    else:
-        a, b, c, d = x, y, w, h
-
-    if isinstance(roi, dict):
-        names = set(roi)
-        if {"x", "y", "w", "h"} <= names:
-            roi.update(x=a, y=b, w=c, h=d)
-        elif {"x", "y", "width", "height"} <= names:
-            roi.update(x=a, y=b, width=c, height=d)
-        elif {"left", "top", "right", "bottom"} <= names:
-            roi.update(left=a, top=b, right=a + c, bottom=b + d)
-        elif {"x1", "y1", "x2", "y2"} <= names:
-            roi.update(x1=a, y1=b, x2=a + c, y2=b + d)
-        elif {"cx", "cy", "radius"} <= names:
-            roi.update(cx=a + c / 2, cy=b + d / 2, radius=min(c, d) / 2)
-        else:
-            raise ValueError(f"Unrecognized {field} format: {sorted(names)}")
-    elif isinstance(roi, list) and len(roi) == 4:
-        target[field] = [a, b, c, d]  # [x, y, width, height]
-    elif roi is None:
-        target[field] = {"x": a, "y": b, "w": c, "h": d}
-    else:
-        raise ValueError(f"Unsupported {field} ROI representation: {type(roi).__name__}")
-
-
-def _patch_rois(config: dict[str, Any], panel: Rect, selections: dict[str, Rect], size: tuple[int, int]) -> None:
-    for ident, item in _find_indicators(config).items():
-        roi_field = next((name for name in ("roi", "roi_norm", "normalized_roi", "roi_normalized") if name in item), None)
-        if roi_field is None:
-            raise ValueError(f"Indicator {ident} has no ROI field in config.json")
-        _write_rect(item, roi_field, selections[ident], size)
-
-    if "panel_roi" in config:
-        _write_rect(config, "panel_roi", panel, size)
-    if isinstance(config.get("panel"), dict) and "roi" in config["panel"]:
-        _write_rect(config["panel"], "roi", panel, size)
-
-
-def _load_config(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Configuration not found: {path}")
-    with path.open("r", encoding="utf-8") as handle:
-        result = json.load(handle)
-    if not isinstance(result, dict):
-        raise ValueError("config.json root must be a JSON object")
-    return result
-
-
-def _capture_frame(source: str):
-    # FFMPEG timeouts are open-only parameters supported by recent OpenCV builds.
-    params = [
-        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10_000,
-        cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10_000,
-    ]
-    capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG, params)
-    try:
-        if not capture.isOpened():
-            raise RuntimeError("Cannot open configured video source")
-        frame = None
-        for _ in range(3):
-            valid, candidate = capture.read()
-            if not valid or candidate is None or candidate.size == 0:
-                if frame is None:
-                    raise RuntimeError("Stream opened but no decoded video frame was received")
-                break
-            frame = candidate
-        if frame is None:
-            raise RuntimeError("No usable video frames received")
-        return frame
-    finally:
-        capture.release()
-
-
-def _fit(image, max_w: int, max_h: int, upsample: bool = False):
-    h, w = image.shape[:2]
-    scale = min(max_w / w, max_h / h)
-    if not upsample:
-        scale = min(1.0, scale)
-    if scale == 1.0:
-        return image.copy()
-    return cv2.resize(image, (max(1, round(w * scale)), max(1, round(h * scale))),
-                      interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA)
-
-
-# A chosen point is converted into a small, clipped rectangular ROI for the
-# existing monitor. The GUI only draws circular markers; no panel box is needed.
-Point = tuple[int, int, int]  # center_x, center_y, radius, in source-frame pixels
-
-
-def _point_to_rect(point: Point, size: tuple[int, int]) -> Rect:
-    """Return a bounded (x, y, w, h) pixel ROI around a marked point."""
-    x, y, radius = point
-    width, height = size
-    if width <= 0 or height <= 0 or radius <= 0:
-        raise ValueError("Invalid frame dimensions or sensor radius")
-    if not (0 <= x < width and 0 <= y < height):
-        raise ValueError(f"Sensor center ({x}, {y}) is outside {width}x{height} frame")
-    left = max(0, x - radius)
-    top = max(0, y - radius)
-    right = min(width, x + radius + 1)
-    bottom = min(height, y + radius + 1)
-    return left, top, right - left, bottom - top
-
-
-def _panel_bounds(selections: dict[str, Rect]) -> Rect:
-    """Bounding ROI containing every indicator, even widely separated ones."""
-    x0 = min(x for x, y, w, h in selections.values())
-    y0 = min(y for x, y, w, h in selections.values())
-    x1 = max(x + w for x, y, w, h in selections.values())
-    y1 = max(y + h for x, y, w, h in selections.values())
-    return x0, y0, x1 - x0, y1 - y0
-
-
-def _original_point(x: int, y: int, display_size: tuple[int, int],
-                    frame_size: tuple[int, int]) -> tuple[int, int]:
-    """Map a click on a scaled view back to original-frame coordinates."""
-    dw, dh = display_size
-    fw, fh = frame_size
-    if not (0 <= x < dw and 0 <= y < dh):
-        raise ValueError("Click was outside the image")
-    return min(fw - 1, int((x + 0.5) * fw / dw)), min(fh - 1, int((y + 0.5) * fh / dh))
-
-
-def _draw_markers(view, points: dict[str, Point], frame_size: tuple[int, int]):
-    """Overlay numbered circles, never ROI rectangles or a panel selection."""
-    result = view.copy()
-    dw, dh = result.shape[1], result.shape[0]
-    fw, fh = frame_size
-    palette = (
-        (40, 40, 255),   # red
-        (40, 240, 40),   # green
-        (0, 230, 255),   # yellow
-        (40, 40, 255),
-        (40, 40, 255),
-    )
-    for index, (ident, _name) in enumerate(INDICATORS):
-        if ident not in points:
-            continue
-        x, y, radius = points[ident]
-        dx = min(dw - 1, int((x + 0.5) * dw / fw))
-        dy = min(dh - 1, int((y + 0.5) * dh / fh))
-        dr = max(2, round(radius * min(dw / fw, dh / fh)))
-        color = palette[index]
-        cv2.circle(result, (dx, dy), dr, color, 2, cv2.LINE_AA)
-        cv2.circle(result, (dx, dy), 2, color, -1, cv2.LINE_AA)
-        cv2.putText(result, str(index + 1),
-                    (min(dw - 14, dx + dr + 5), max(14, dy - dr - 3)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
-    return result
-
-
-# Explicitly labeled buttons are rendered in the image itself. This avoids
-# Qt's icon-only HighGUI toolbar and keeps controls visible without tooltips.
-Button = tuple[str, str, Rect]  # action, visible label, (x, y, w, h)
-
-
-def _toolbar_layout(display_width: int) -> tuple[int, list[Button]]:
-    """Lay out all text-labeled controls, wrapping on narrower displays."""
-    if display_width < 180:
-        raise ValueError("Calibration image is too narrow for the on-screen controls")
-
-    sensor_controls = [
-        (f"sensor:{index}", f"{index + 1} {name}")
-        for index, (_ident, name) in enumerate(INDICATORS)
-    ]
-    edit_controls = [
-        ("undo", "Undo (U)"),
-        ("clear", "Clear Sensor (D)"),
-        ("reset", "Reset All (R)"),
-        ("smaller", "Radius -"),
-        ("larger", "Radius +"),
-        ("save", "Save (S)"),
-        ("quit", "Quit (Q)"),
-    ]
-
-    margin, gap, row_height, row_gap = 9, 7, 31, 6
-    y = 29  # Space for an always-visible, plain-text instruction line.
-    buttons: list[Button] = []
-    for row in (sensor_controls, edit_controls):
-        x = margin
-        for action, label in row:
-            text_width, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)[0]
-            button_width = min(display_width - 2 * margin, text_width + 18)
-            if x != margin and x + button_width > display_width - margin:
-                x = margin
-                y += row_height + row_gap
-            buttons.append((action, label, (x, y, button_width, row_height)))
-            x += button_width + gap
-        y += row_height + row_gap
-    return y + 5, buttons
-
-
-def _button_at(x: int, y: int, buttons: list[Button]) -> str | None:
-    """Return only a real button action; clicks elsewhere do nothing."""
-    for action, _label, (bx, by, bw, bh) in buttons:
-        if bx <= x < bx + bw and by <= y < by + bh:
-            return action
-    return None
-
-
-def _draw_interface(view, points: dict[str, Point], active_index: int,
-                    radius: int, frame_size: tuple[int, int]):
-    """Paint labeled clickable controls above the image and status below it."""
-    toolbar_height, buttons = _toolbar_layout(view.shape[1])
-    status_height = 53
-    canvas = cv2.copyMakeBorder(
-        _draw_markers(view, points, frame_size),
-        toolbar_height, status_height, 0, 0,
-        cv2.BORDER_CONSTANT, value=(28, 28, 28),
-    )
-    cv2.putText(
-        canvas, "Choose a sensor, then CLICK its center in the image to mark or move it.",
-        (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.49,
-        (245, 245, 245), 1, cv2.LINE_AA,
-    )
-    for action, label, (x, y, w, h) in buttons:
-        if action == f"sensor:{active_index}":
-            fill = (118, 85, 36)
-        elif action.startswith("sensor:") and INDICATORS[int(action.split(':')[1])][0] in points:
-            fill = (59, 108, 57)
-        elif action == "save":
-            fill = (60, 116, 49) if len(points) == len(INDICATORS) else (63, 63, 63)
-        elif action == "reset":
-            fill = (48, 69, 127)
-        else:
-            fill = (63, 63, 63)
-        cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1), fill, -1)
-        cv2.rectangle(canvas, (x, y), (x + w - 1, y + h - 1),
-                      (165, 165, 165), 1)
-        text_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
-        text_x = x + max(4, (w - text_size[0]) // 2)
-        text_y = y + (h + text_size[1]) // 2
-        cv2.putText(canvas, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.46, (255, 255, 255), 1, cv2.LINE_AA)
-
-    footer_y = toolbar_height + view.shape[0]
-    _ident, active_name = INDICATORS[active_index]
-    messages = (
-        f"Selected: {active_index + 1} {active_name}    Radius: {radius}px    "
-        f"Marked: {len(points)}/5    Green buttons = marked sensors.",
-        "Click sensor button to reposition | Undo reverses last click | "
-        "Clear Sensor removes one | Reset All removes every point.",
-    )
-    for index, message in enumerate(messages):
-        cv2.putText(canvas, message, (10, footer_y + 20 + index * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (245, 245, 245),
-                    1, cv2.LINE_AA)
-    return canvas
-
-
-def _select_points(frame, initial_radius: int) -> dict[str, Point]:
-    """Place five independent centers using labeled buttons or keyboard."""
-    view = _fit(frame, 1500, 830)
-    frame_size = frame.shape[1], frame.shape[0]
-    display_size = view.shape[1], view.shape[0]
-    toolbar_height, buttons = _toolbar_layout(display_size[0])
-    window = "ColorCatcher - sensor calibration"
-    points: dict[str, Point] = {}
-    history: list[tuple[str, Point | None]] = []
-    active = 0
-    radius = initial_radius
-    requested_action: str | None = None
-
-    def click(event: int, x: int, y: int, _flags: int, _userdata: object) -> None:
-        nonlocal active, requested_action
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        if y < toolbar_height:
-            requested_action = _button_at(x, y, buttons)
-            return
-        # The toolbar is ABOVE the image, and must not shift stored coordinates.
-        image_y = y - toolbar_height
-        if not (0 <= x < display_size[0] and 0 <= image_y < display_size[1]):
-            return
-        original_x, original_y = _original_point(x, image_y, display_size, frame_size)
-        ident, name = INDICATORS[active]
-        history.append((ident, points.get(ident)))
-        points[ident] = (original_x, original_y, radius)
-        print(f"{active + 1}. {name}: center=({original_x}, {original_y}), radius={radius}px", flush=True)
-        for next_index in range(active + 1, len(INDICATORS)):
-            if INDICATORS[next_index][0] not in points:
-                active = next_index
-                break
-        else:
-            for next_index, (next_ident, _) in enumerate(INDICATORS):
-                if next_ident not in points:
-                    active = next_index
-                    break
-
-    def perform(action: str) -> bool:
-        """Apply an action. True means the completed calibration should be saved."""
-        nonlocal active, radius
-        if action.startswith("sensor:"):
-            active = int(action.split(":", 1)[1])
-            ident = INDICATORS[active][0]
-            if ident in points:
-                radius = points[ident][2]
-        elif action == "smaller" or action == "larger":
-            radius = max(1, radius - 1) if action == "smaller" else min(radius + 1, max(frame_size))
-            ident = INDICATORS[active][0]
-            if ident in points:
-                x, y, _ = points[ident]
-                points[ident] = x, y, radius
-        elif action == "undo":
-            if history:
-                ident, previous = history.pop()
-                if previous is None:
-                    points.pop(ident, None)
-                else:
-                    points[ident] = previous
-                active = next(i for i, (item_id, _) in enumerate(INDICATORS) if item_id == ident)
-                radius = points[ident][2] if ident in points else initial_radius
-        elif action == "clear":
-            ident, name = INDICATORS[active]
-            if ident in points:
-                history.append((ident, points[ident]))
-                del points[ident]
-                print(f"Cleared selection for {active + 1}. {name}.", flush=True)
-        elif action == "reset":
-            points.clear()
-            history.clear()
-            active = 0
-            radius = initial_radius
-            print("All five selections cleared.", flush=True)
-        elif action == "save":
-            if len(points) != len(INDICATORS):
-                print(f"Complete all five points before saving ({len(points)}/5).", flush=True)
-            else:
-                return True
-        elif action == "quit":
-            raise KeyboardInterrupt("Calibration cancelled")
-        return False
-
-    print("\nClick the labeled sensor button (1-5), then its CENTER anywhere in the image.")
-    print("The buttons remain visible; you can reposition any sensor or clear it.")
-    print("Undo (U), Clear Sensor (D), Reset All (R), Radius +/- , Save (S), Quit (Q).\n", flush=True)
-    # On Qt builds, GUI_NORMAL disables the unlabeled OpenCV icon toolbar.
-    cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
-    try:
-        cv2.setMouseCallback(window, click)
-        while True:
-            cv2.imshow(window, _draw_interface(view, points, active, radius, frame_size))
-            key = cv2.waitKey(30) & 0xFF
-            action = requested_action
-            requested_action = None
-            if action is None:
-                if key in (27, ord('q'), ord('Q')):
-                    action = "quit"
-                elif ord('1') <= key <= ord('5'):
-                    action = f"sensor:{key - ord('1')}"
-                else:
-                    action = {
-                        ord('+'): "larger", ord('='): "larger",
-                        ord('-'): "smaller", ord('_'): "smaller",
-                        ord('u'): "undo", ord('U'): "undo", 8: "undo",
-                        ord('d'): "clear", ord('D'): "clear",
-                        ord('r'): "reset", ord('R'): "reset",
-                        ord('s'): "save", ord('S'): "save", 13: "save",
-                    }.get(key)
-            if action is not None and perform(action):
-                return points.copy()
-            try:
-                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                    raise KeyboardInterrupt("Calibration window closed")
-            except cv2.error as exc:
-                raise KeyboardInterrupt("Calibration window closed") from exc
-    finally:
-        try:
-            cv2.destroyWindow(window)
-        except cv2.error:
-            pass
-
-
-def _annotated_preview(frame, points: dict[str, Point]):
-    return _draw_markers(frame, points, (frame.shape[1], frame.shape[0]))
-
-
-def _write_image(path: Path, image) -> None:
+def _save_atomic(path: Path, data: dict) -> None:
+    """Backup old configuration; fsync and atomically replace on same filesystem."""
+    from main import validate_config
+    validate_config(data, operational=False)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), image):
-        raise OSError(f"Cannot save image to {path}")
-
-
-def _atomic_save_config(path: Path, config: dict[str, Any]) -> None:
-    # Preserve an original backup, then replace the config atomically on POSIX.
-    backup = path.with_suffix(path.suffix + ".bak")
-    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        os.chmod(temp, stat.S_IMODE(path.stat().st_mode))
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        if os.name == "posix":
+            os.chmod(temp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             fd = -1
-            json.dump(config, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        shutil.copy2(path, backup)
-        os.replace(temp, path)
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.exists():
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        os.replace(temp_path, path)
     finally:
         if fd != -1:
             os.close(fd)
-        if os.path.exists(temp):
-            os.unlink(temp)
+        Path(temp_path).unlink(missing_ok=True)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Point-and-click calibration of five independent factory indicators")
-    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent / "config.json")
-    parser.add_argument("--source", help="Optional alternative video URL or local video filename")
-    parser.add_argument("--image", type=Path, help="Calibrate entirely offline from an existing full-frame image")
-    parser.add_argument("--radius", type=int, default=8,
-                        help="Initial sensor-circle radius in original-frame pixels (default: 8)")
-    args = parser.parse_args()
-    if args.radius <= 0:
-        parser.error("--radius must be a positive integer")
-    config_path: Path = args.config.resolve()
-    config = _load_config(config_path)
+def _images(args: argparse.Namespace, config: dict) -> list[np.ndarray]:
+    paths = args.image or []
+    if paths:
+        frames = []
+        for path in paths:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise ValueError(f"Cannot open local image: {path}")
+            frames.append(frame)
+        return frames
+    source = args.source or config["stream"]["url"]
+    if not source:
+        raise ValueError("Specify --image FILE [FILE ...] or an authorized --source")
+    with StreamReader(source, config["stream"]["open_timeout_seconds"],
+                      config["stream"]["read_timeout_seconds"]) as reader:
+        return [reader.read_first_frame()]
 
-    # Refuse unsupported config layouts BEFORE opening a remote stream.
-    trial = copy.deepcopy(config)
-    _patch_dimensions(trial, 640, 480)
-    dummy = (10, 10, 12, 12)
-    _patch_rois(trial, dummy, {ident: dummy for ident, _ in INDICATORS}, (640, 480))
 
-    if args.image:
-        image_path = args.image.resolve()
-        frame = cv2.imread(str(image_path))
-        if frame is None:
-            raise RuntimeError(f"Cannot read image: {image_path}")
-    else:
-        source = args.source or _stream_source(config)
-        if not source.startswith(("http://", "https://", "rtsp://", "rtmp://")):
-            candidate = Path(source).expanduser()
-            if not candidate.is_absolute():
-                candidate = config_path.parent / candidate
-            source = str(candidate)
-        print("Opening video source and capturing one frame (no continuous monitoring)...", flush=True)
-        frame = _capture_frame(source)
+class Calibrator:
+    """OpenCV GUI retaining sensor buttons, click-to-place, undo, clear and radius tools."""
 
-    height, width = frame.shape[:2]
-    if width <= 0 or height <= 0:
-        raise ValueError("Decoded frame has invalid dimensions")
-    print(f"Reference frame resolution: {width} x {height}")
-    snapshot = config_path.parent / "calibration_frame.jpg"
-    _write_image(snapshot, frame)
-    print(f"Original screenshot saved: {snapshot}")
+    def __init__(self, config: dict, frames: list[np.ndarray], config_path: Path, radius: int):
+        self.config, self.frames, self.path = config, frames, config_path
+        self.active = 0
+        self.page = 0
+        self.frame_index = 0
+        self.radius = radius
+        self.history: list[dict] = []
+        self.message = "Select a sensor, click its CENTER. Save captures all missing brightness baselines."
+        self.reference_mode = False
+        self.reference_start: tuple[int, int] | None = None
+        self.action: str | None = None
+        self.window = "ColorCatcher - sensor calibration"
+        self.view_max = (1450, 810)
+        self.frame_size = (frames[0].shape[1], frames[0].shape[0])
+        for frame in frames:
+            if (frame.shape[1], frame.shape[0]) != self.frame_size:
+                raise ValueError("Calibration images must have identical frame dimensions")
+        original_size = (config["video"]["reference_width"],
+                         config["video"]["reference_height"])
+        if original_size != self.frame_size:
+            for sensor in config["indicators"]:
+                sensor["roi"] = None
+                sensor["reference_roi"] = None
+                _invalidate(sensor)
+            self.message = "Video resolution changed: all sensor ROIs and thresholds require recalibration."
+        config["video"]["reference_width"], config["video"]["reference_height"] = self.frame_size
+        self.page_size = 8
+        self.buttons: list[tuple[str, tuple[int, int, int, int]]] = []
+        self.toolbar_height = 0
+        self._view_size()
 
+    @property
+    def sensors(self) -> list[dict]:
+        return self.config["indicators"]
+
+    def _view_size(self) -> None:
+        width, height = self.frame_size
+        scale = min(1.0, self.view_max[0]/width, self.view_max[1]/height)
+        self.display_size = (max(1, round(width*scale)), max(1, round(height*scale)))
+
+    def _to_frame(self, x: int, y: int) -> tuple[int, int]:
+        dw, dh = self.display_size
+        fw, fh = self.frame_size
+        return min(fw-1, int((x+0.5)*fw/dw)), min(fh-1, int((y+0.5)*fh/dh))
+
+    def _snapshot(self) -> None:
+        self.history.append({"indicators": copy.deepcopy(self.sensors)})
+        if len(self.history) > 50:
+            self.history.pop(0)
+
+    def _buttons(self) -> tuple[int, list[tuple[str, tuple[int, int, int, int]]]]:
+        width = self.display_size[0]
+        buttons: list[tuple[str, tuple[int, int, int, int]]] = []
+        rows: list[list[tuple[str, str]]] = []
+        begin = self.page*self.page_size
+        current = [(f"sensor:{i}", f"{i+1}:{s['id'][:14]}")
+                   for i, s in enumerate(self.sensors) if begin <= i < begin+self.page_size]
+        rows.append(current)
+        rows.append([("page_prev", "< Sensors"), ("page_next", "Sensors >"),
+                     ("frame_prev", "< Frame"), ("frame_next", "Frame >")])
+        rows.append([("smaller", "Radius -"), ("larger", "Radius +"),
+                     ("reference", "Ref ROI"), ("clear_ref", "Clear Ref"),
+                     ("capture_baseline", "Set Baseline")])
+        rows.append([("toggle_state", "Toggle ON/OFF"), ("undo", "Undo"), ("clear", "Clear Sensor"),
+                     ("reset", "Reset All"), ("save", "Save"), ("quit", "Quit")])
+        y = 31
+        for row in rows:
+            x = 8
+            for action, label in row:
+                btn_width = min(150, max(66, 10+len(label)*9))
+                if x + btn_width > width:
+                    x, y = 8, y+35
+                buttons.append((action, (x, y, btn_width, 27)))
+                x += btn_width+6
+            y += 35
+        return y+5, buttons
+
+    def _mouse(self, event: int, x: int, y: int, flags: int, _: object) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN and y < self.toolbar_height:
+            self.action = next((a for a, (bx, by, bw, bh) in self.buttons
+                                if bx <= x < bx+bw and by <= y < by+bh), None)
+            return
+        image_y = y - self.toolbar_height
+        if not (0 <= x < self.display_size[0] and 0 <= image_y < self.display_size[1]):
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if self.reference_mode:
+                self.reference_start = self._to_frame(x, image_y)
+            else:
+                sensor = self.sensors[self.active]
+                fw, fh = self.frame_size
+                px, py = self._to_frame(x, image_y)
+                r = self.radius
+                x0, y0 = max(0, px-r), max(0, py-r)
+                rect = [x0, y0, min(fw, px+r+1)-x0, min(fh, py+r+1)-y0]
+                self._snapshot()
+                sensor["roi"] = rect
+                capture_baseline(sensor, self.frames[self.frame_index])
+                self.message = (f"{sensor['id']}: baseline mean "
+                                f"{sensor['baseline_brightness']:.2f} captured.")
+        elif event == cv2.EVENT_LBUTTONUP and self.reference_mode and self.reference_start:
+            px, py = self._to_frame(x, image_y)
+            x0, y0 = self.reference_start
+            rect = [min(x0, px), min(y0, py), abs(px-x0)+1, abs(py-y0)+1]
+            self.reference_start = None
+            self.reference_mode = False
+            if rect[2] < 4 or rect[3] < 4:
+                self.message = "Reference ROI must be at least 4x4 pixels."
+                return
+            self._snapshot()
+            sensor = self.sensors[self.active]
+            sensor["reference_roi"] = rect
+            capture_baseline(sensor, self.frames[self.frame_index])
+            self.message = f"Ambient reference saved for {sensor['id']}; baseline updated."
+
+    def _capture(self) -> None:
+        sensor = self.sensors[self.active]
+        if sensor["roi"] is None:
+            self.message = f"Position {sensor['id']} before capturing a baseline."
+            return
+        self._snapshot()
+        measured = capture_baseline(sensor, self.frames[self.frame_index])
+        self.message = f"{sensor['id']}: baseline = {measured:.2f} (mean gray level)"
+
+    def _action(self, action: str) -> bool:
+        if action.startswith("sensor:"):
+            self.active = int(action.partition(":")[2])
+            self.page = self.active//self.page_size
+            roi = self.sensors[self.active].get("roi")
+            if roi:
+                self.radius = max(2, (max(roi[2], roi[3])-1)//2)
+        elif action in ("page_prev", "page_next"):
+            pages = (len(self.sensors)-1)//self.page_size+1
+            self.page = (self.page + (-1 if action == "page_prev" else 1)) % pages
+        elif action in ("frame_prev", "frame_next"):
+            self.frame_index = (self.frame_index + (-1 if action == "frame_prev" else 1)) % len(self.frames)
+        elif action in ("smaller", "larger"):
+            self.radius = max(2, min(200, self.radius+(-1 if action == "smaller" else 1)))
+            sensor = self.sensors[self.active]
+            if sensor.get("roi"):
+                x, y, w, h = sensor["roi"]
+                cx, cy = x+w//2, y+h//2
+                fw, fh = self.frame_size
+                self._snapshot()
+                left, top = max(0, cx-self.radius), max(0, cy-self.radius)
+                sensor["roi"] = [left, top, min(fw, cx+self.radius+1)-left,
+                                 min(fh, cy+self.radius+1)-top]
+                capture_baseline(sensor, self.frames[self.frame_index])
+        elif action == "reference":
+            self.reference_mode = True
+            self.message = "Drag a rectangle on a stable DARK background (not an indicator)."
+        elif action == "clear_ref":
+            self._snapshot()
+            self.sensors[self.active]["reference_roi"] = None
+            if self.sensors[self.active]["roi"] is not None:
+                capture_baseline(self.sensors[self.active], self.frames[self.frame_index])
+        elif action == "capture_baseline":
+            self._capture()
+        elif action == "toggle_state":
+            self._snapshot()
+            sensor = self.sensors[self.active]
+            sensor["baseline_state"] = "OFF" if sensor.get("baseline_state", sensor["normal_state"]) == "ON" else "ON"
+            self.message = f"{sensor['id']}: baseline frame shows {sensor['baseline_state']} (operator-selected)"
+        elif action == "undo":
+            if self.history:
+                self.config["indicators"] = self.history.pop()["indicators"]
+        elif action == "clear":
+            self._snapshot()
+            self.sensors[self.active]["roi"] = None
+            _invalidate(self.sensors[self.active])
+        elif action == "reset":
+            self._snapshot()
+            for sensor in self.sensors:
+                sensor["roi"] = None
+                sensor["reference_roi"] = None
+                _invalidate(sensor)
+        elif action == "save":
+            missing = [s["id"] for s in self.sensors if s["roi"] is None]
+            if missing:
+                self.message = f"Cannot save: position sensor(s): {', '.join(missing[:5])}"
+                return False
+            # Save automatically measures sensors without a baseline from the displayed frame.
+            # Existing saved baselines remain stable until expressly replaced or ROI moved.
+            for sensor in self.sensors:
+                if sensor.get("baseline_brightness") is None or (sensor.get("reference_roi") is not None and sensor.get("baseline_reference_brightness") is None):
+                    capture_baseline(sensor, self.frames[self.frame_index])
+            # Panel ROI is optional visual reference, no containment requirement.
+            x0 = min(s["roi"][0] for s in self.sensors)
+            y0 = min(s["roi"][1] for s in self.sensors)
+            x1 = max(s["roi"][0]+s["roi"][2] for s in self.sensors)
+            y1 = max(s["roi"][1]+s["roi"][3] for s in self.sensors)
+            self.config["panel_roi"] = [x0, y0, x1-x0, y1-y0]
+            _save_atomic(self.path, self.config)
+            calibrated = sum(s.get("baseline_brightness") is not None for s in self.sensors)
+            print(f"Saved {len(self.sensors)} sensor ROIs to {self.path}; brightness baselines: {calibrated}/{len(self.sensors)}")
+            print("Confirm each sensor's baseline_state matches its actual illumination in the captured frame.")
+            return True
+        elif action == "quit":
+            raise Cancelled("Calibration cancelled; configuration unchanged")
+        return False
+
+    def _draw(self) -> np.ndarray:
+        frame = self.frames[self.frame_index]
+        dw, dh = self.display_size
+        view = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_AREA)
+        canvas = view.copy()
+        fw, fh = self.frame_size
+        for idx, sensor in enumerate(self.sensors):
+            rect = sensor.get("roi")
+            if rect:
+                x, y, w, h = rect
+                px, py = round(x*dw/fw), round(y*dh/fh)
+                qx, qy = round((x+w)*dw/fw), round((y+h)*dh/fh)
+                color = (0, 230, 255) if idx == self.active else (30, 210, 30)
+                cv2.rectangle(canvas, (px, py), (qx, qy), color, 1 if idx != self.active else 2)
+                cv2.putText(canvas, str(idx+1), (px, max(13, py-4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
+            if idx == self.active and sensor.get("reference_roi"):
+                x, y, w, h = sensor["reference_roi"]
+                cv2.rectangle(canvas, (round(x*dw/fw), round(y*dh/fh)),
+                              (round((x+w)*dw/fw), round((y+h)*dh/fh)), (255, 160, 20), 2)
+        self.toolbar_height, self.buttons = self._buttons()
+        surface = cv2.copyMakeBorder(canvas, self.toolbar_height, 85, 0, 0,
+                                     cv2.BORDER_CONSTANT, value=(30, 30, 30))
+        cv2.putText(surface, "Select sensor -> click center | Set baseline (B) | Save",
+                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, .48, (240, 240, 240), 1)
+        for action, (x, y, w, h) in self.buttons:
+            label = (f"{int(action.split(':')[1])+1}:{self.sensors[int(action.split(':')[1])]['id'][:14]}"
+                     if action.startswith("sensor:") else {
+                         "page_prev": "< Sensors", "page_next": "Sensors >", "frame_prev": "< Frame",
+                         "frame_next": "Frame >", "smaller": "Radius -", "larger": "Radius +",
+                         "reference": "Ref ROI", "clear_ref": "Clear Ref", "capture_baseline": "Set Baseline",
+                         "undo": "Undo", "clear": "Clear Sensor",
+                         "toggle_state": "Toggle ON/OFF", "reset": "Reset All", "save": "Save", "quit": "Quit"}[action])
+            color = ((100, 90, 40) if action == f"sensor:{self.active}"
+                     else (58, 115, 49) if action == "save"
+                     else (65, 65, 65))
+            cv2.rectangle(surface, (x,y), (x+w,y+h), color, -1)
+            cv2.rectangle(surface, (x,y), (x+w,y+h), (175, 175, 175), 1)
+            cv2.putText(surface, label, (x+3, y+19), cv2.FONT_HERSHEY_SIMPLEX,
+                        .36 if len(label) > 14 else .43, (255, 255, 255), 1)
+        sensor = self.sensors[self.active]
+        footer = self.toolbar_height+dh
+        summary = (f"Selected {self.active+1}/{len(self.sensors)} {sensor['id']} "
+                   f"| Frame {self.frame_index+1}/{len(self.frames)} | Radius {self.radius}px "
+                   f"| Baseline {sensor.get('baseline_brightness')} {sensor.get('baseline_state', sensor['normal_state'])}")
+        cv2.putText(surface, summary[:125], (8, footer+22), cv2.FONT_HERSHEY_SIMPLEX,
+                    .48, (245,245,245), 1)
+        cv2.putText(surface, self.message[:150], (8, footer+44), cv2.FONT_HERSHEY_SIMPLEX,
+                    .42, (180,225,245), 1)
+        cv2.putText(surface, "Keys: S save, T toggle ON/OFF at baseline, Q quit, U undo, D clear, R reset, B baseline, A ambient ROI",
+                    (8, footer+69), cv2.FONT_HERSHEY_SIMPLEX, .38, (210,210,210), 1)
+        return surface
+
+    def run(self) -> None:
+        cv2.namedWindow(self.window, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+        cv2.setMouseCallback(self.window, self._mouse)
+        try:
+            while True:
+                cv2.imshow(self.window, self._draw())
+                key = cv2.waitKey(30) & 0xff
+                action, self.action = self.action, None
+                if action is None:
+                    action = {27:"quit", ord('q'):"quit", ord('Q'):"quit",
+                              ord('s'):"save", ord('S'):"save", 13:"save",
+                              ord('u'):"undo", ord('U'):"undo", 8:"undo",
+                              ord('d'):"clear", ord('D'):"clear",
+                              ord('r'):"reset", ord('R'):"reset",
+                              ord('+'):"larger", ord('='):"larger", ord('-'):"smaller",
+                              ord('t'):"toggle_state", ord('T'):"toggle_state",
+                              ord('b'):"capture_baseline", ord('B'):"capture_baseline",
+                              ord('a'):"reference", ord('A'):"reference",
+                              ord('n'):"frame_next", ord('p'):"frame_prev",
+                              ord(']'):"page_next", ord('['):"page_prev"}.get(key)
+                    if ord('1') <= key <= ord('8'):
+                        index = self.page*self.page_size + key-ord('1')
+                        if index < len(self.sensors):
+                            action = f"sensor:{index}"
+                if action and self._action(action):
+                    return
+                if cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) < 1:
+                    raise Cancelled("Calibration window closed")
+        finally:
+            cv2.destroyWindow(self.window)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="ColorCatcher baseline brightness calibration; GUI, 1..N sensors")
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
+    parser.add_argument("--image", nargs="+", type=Path,
+                        help="One or more offline full-resolution calibration images")
+    parser.add_argument("--source", help="Authorized video URL or local video file")
+    parser.add_argument("--radius", type=int, default=8)
+    parser.add_argument("--confirm-delete", action="store_true",
+                        help="Explicitly authorize removing sensors exceeding sensor_count")
+    args = parser.parse_args(argv)
     try:
-        points = _select_points(frame, args.radius)
-        selections = {
-            ident: _point_to_rect(points[ident], (width, height))
-            for ident, _ in INDICATORS
-        }
-        panel = _panel_bounds(selections)
-
-        preview = _annotated_preview(frame, points)
-        preview_path = config_path.parent / "calibration_preview.jpg"
-        _write_image(preview_path, preview)
-        print(f"Annotated preview saved: {preview_path}")
-        for index, (ident, name) in enumerate(INDICATORS, 1):
-            print(f"  {index}. {name:18s} {ident:7s} ROI {selections[ident]}")
-
-        updated = copy.deepcopy(config)
-        _patch_dimensions(updated, width, height)
-        _patch_rois(updated, panel, selections, (width, height))
-        _atomic_save_config(config_path, updated)
-        print(f"Calibration saved to: {config_path}")
-        print(f"Backup saved to: {config_path.with_suffix(config_path.suffix + '.bak')}")
+        if args.radius < 2:
+            raise ValueError("--radius must be >= 2")
+        path = args.config.resolve()
+        with path.open(encoding="utf-8") as source:
+            config = json.load(source)
+        reconcile_count(config, confirm_delete=args.confirm_delete)
+        from main import validate_config
+        validate_config(config, operational=False)
+        frames = _images(args, config)
+        Calibrator(config, frames, path, args.radius).run()
         return 0
-    finally:
-        cv2.destroyAllWindows()
+    except Cancelled as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except (OSError, KeyError, TypeError, ValueError, cv2.error) as exc:
+        print(f"Calibration failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        print("Calibration cancelled. config.json was not modified.", file=sys.stderr)
-        sys.exit(130)
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError, cv2.error) as exc:
-        print(f"Calibration failed: {exc}", file=sys.stderr)
-        sys.exit(1)
+    sys.exit(main())
