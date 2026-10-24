@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.py[cod]
+
+# Virtual env
+.venv/
+.env/
+
+# Poetry
+poetry.lock
+
+# Images
+screenshots/*
+!screenshots/.gitkeep
+calibration_frame.jpg
+inspection.jpg
+demo.avi
+
+# Config
+config.json.bak
+config.json
+demo_config.json
+
+# Mgmt
+git.sh
+
+# Misc
+*.html
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*~
