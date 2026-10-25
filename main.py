@@ -63,8 +63,6 @@ def validate_config(config: dict, *, operational: bool = True) -> None:
     _number(output["jpeg_quality"], "output.jpeg_quality", 1, 100, integer=True)
     _number(output["screenshot_retries"], "output.screenshot_retries", 1, 10, integer=True)
     _number(det["brightness_change_percent"], "detection.brightness_change_percent", 0.01, 1000)
-    if not isinstance(output.get("save_verification_preview"), bool):
-        raise ValueError("output.save_verification_preview must be boolean")
     if not isinstance(output.get("screenshots_dir"), str) or not output["screenshots_dir"].strip():
         raise ValueError("output.screenshots_dir must be a nonempty path")
     if not isinstance(output.get("timezone"), str):
@@ -231,8 +229,7 @@ def monitor(config: dict, config_path: Path, source: str) -> None:
                     if change is not None:
                         changes.append(change)
                 if emit(changes, frame, timestamp, shot_directory,
-                        config["output"]["jpeg_quality"], config["output"]["save_verification_preview"],
-                        config["output"]["screenshot_retries"]):
+                        config["output"]["jpeg_quality"], config["output"]["screenshot_retries"]):
                     LOG.error("EVIDENCE_DEGRADED: one or more screenshot writes failed")
         except CalibrationError:
             raise

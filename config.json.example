@@ -1,154 +1,110 @@
 {
+  "schema_version": 3,
+  "sensor_count": 5,
   "stream": {
-    "url": "https://<URI>.m3u8",
+    "url": "https://<<<<<URL>>>>>.m3u8",
     "open_timeout_seconds": 10,
     "read_timeout_seconds": 10,
     "reconnect_delay_seconds": 3
   },
   "video": {
-    "detection_fps": 5,
+    "detection_fps": null,
     "reference_width": 1280,
-    "reference_height": 720,
-    "panel_roi": null,
-    "min_panel_mean_brightness": 15
+    "reference_height": 720
   },
   "detection": {
     "confirmation_frames": 2,
-    "inner_ellipse_fraction": 0.82
+    "max_uncertain_seconds": 2.0,
+    "brightness_change_percent": 18.0
   },
   "output": {
     "screenshots_dir": "screenshots",
     "timezone": "local",
-    "jpeg_quality": 90
+    "jpeg_quality": 90,
+    "save_verification_preview": true,
+    "screenshot_retries": 2
   },
   "indicators": [
     {
       "id": "RED_1",
       "name": "System Failure",
-      "color": "red",
       "normal_state": "OFF",
       "roi": [
-        136,
-        586,
+        722,
+        412,
         17,
         17
       ],
-      "hue_ranges": [
-        [
-          0,
-          12
-        ],
-        [
-          168,
-          179
-        ]
-      ],
-      "min_saturation": 120,
-      "min_brightness": 170,
-      "on_fraction": 0.24,
-      "off_fraction": 0.08
+      "reference_roi": null,
+      "baseline_brightness": 223.2664,
+      "baseline_reference_brightness": null,
+      "baseline_state": "OFF"
     },
     {
       "id": "GREEN",
       "name": "Status OK",
-      "color": "green",
       "normal_state": "ON",
       "roi": [
-        139,
-        562,
+        722,
+        428,
         17,
         17
       ],
-      "hue_ranges": [
-        [
-          35,
-          90
-        ]
-      ],
-      "min_saturation": 95,
-      "min_brightness": 135,
-      "on_fraction": 0.22,
-      "off_fraction": 0.07
+      "reference_roi": null,
+      "baseline_brightness": 232.9723,
+      "baseline_reference_brightness": null,
+      "baseline_state": "ON"
     },
     {
       "id": "YELLOW",
       "name": "In Production",
-      "color": "yellow",
       "normal_state": "ON",
       "roi": [
-        140,
-        540,
+        722,
+        443,
         17,
         17
       ],
-      "hue_ranges": [
-        [
-          15,
-          40
-        ]
-      ],
-      "min_saturation": 90,
-      "min_brightness": 150,
-      "on_fraction": 0.22,
-      "off_fraction": 0.07
+      "reference_roi": null,
+      "baseline_brightness": 120.9792,
+      "baseline_reference_brightness": null,
+      "baseline_state": "ON"
     },
     {
       "id": "RED_2",
       "name": "Pressure Failure",
-      "color": "red",
       "normal_state": "OFF",
       "roi": [
-        147,
-        627,
+        1131,
+        285,
         17,
         17
       ],
-      "hue_ranges": [
-        [
-          0,
-          12
-        ],
-        [
-          168,
-          179
-        ]
-      ],
-      "min_saturation": 120,
-      "min_brightness": 170,
-      "on_fraction": 0.24,
-      "off_fraction": 0.08
+      "reference_roi": null,
+      "baseline_brightness": 123.8789,
+      "baseline_reference_brightness": null,
+      "baseline_state": "OFF"
     },
     {
       "id": "RED_3",
       "name": "Machine Failure",
-      "color": "red",
       "normal_state": "OFF",
       "roi": [
-        145,
-        604,
+        140,
+        562,
         17,
         17
       ],
-      "hue_ranges": [
-        [
-          0,
-          12
-        ],
-        [
-          168,
-          179
-        ]
-      ],
-      "min_saturation": 120,
-      "min_brightness": 170,
-      "on_fraction": 0.24,
-      "off_fraction": 0.08
+      "reference_roi": null,
+      "baseline_brightness": 92.7716,
+      "baseline_reference_brightness": null,
+      "baseline_state": "OFF"
     }
   ],
   "panel_roi": [
-    136,
-    540,
-    28,
-    104
+    140,
+    285,
+    1008,
+    294
   ]
 }
